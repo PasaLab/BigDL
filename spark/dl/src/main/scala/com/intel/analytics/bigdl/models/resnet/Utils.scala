@@ -39,6 +39,8 @@ object Utils {
     learningRate: Double = 0.1,
     weightDecay: Double = 1e-4,
     momentum: Double = 0.9,
+    movingRate: Double = 0.9,
+    commPeriod: Int = 1,
     dampening: Double = 0.0,
     nesterov: Boolean = true)
 
@@ -80,6 +82,12 @@ object Utils {
     opt[Double]("momentum")
       .text("momentum of ResNet; default is 0.9")
       .action((x, c) => c.copy(momentum = x))
+    opt[Double]("movingRate")
+      .text("movingRate of ResNet for EASGD; default is 0.9")
+      .action((x, c) => c.copy(movingRate = x))
+    opt[Int]("commPeriod")
+      .text("commPeriod of ResNet for EASGD; default is 1")
+      .action((x, c) => c.copy(commPeriod = x))
     opt[Double]("weightDecay")
       .text("weightDecay of ResNet; default is 1e-4")
       .action((x, c) => c.copy(weightDecay = x))

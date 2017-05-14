@@ -76,7 +76,9 @@ object Train {
           "momentum" -> param.momentum,
           "dampening" -> param.dampening,
           "nesterov" -> param.nesterov,
-          "learningRateSchedule" -> SGD.EpochDecay(cifar10Decay)
+          "learningRateSchedule" -> SGD.EpochDecay(cifar10Decay),
+          "movingRate" -> param.movingRate / Engine.nodeNumber,
+          "commPeriod" -> param.commPeriod
         )
       }
 
@@ -90,6 +92,7 @@ object Train {
       }
 
       optimizer
+//        .setOptimMethod(new EAMSGD[Float]())
         .setState(state)
         .setValidation(Trigger.everyEpoch,
           validateSet, Array(new Top1Accuracy[Float]))
