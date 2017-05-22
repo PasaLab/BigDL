@@ -19,7 +19,7 @@ package com.intel.analytics.bigdl.optim
 import com.intel.analytics.bigdl.{Module, _}
 import com.intel.analytics.bigdl.dataset.{DistributedDataSet, MiniBatch}
 import com.intel.analytics.bigdl.nn.Module
-import com.intel.analytics.bigdl.parameters.AllReduceParameter
+import com.intel.analytics.bigdl.parameters.{AllReduceParameter, FutureResult}
 import com.intel.analytics.bigdl.tensor.Tensor
 import com.intel.analytics.bigdl.tensor.TensorNumericMath.TensorNumeric
 import com.intel.analytics.bigdl.utils._
@@ -134,6 +134,7 @@ object DistriOptimizer {
     var dropModelNumBatch = 0
     var lossArray = new Array[Double](_subModelNumber)
     val isEASGD = optimMethod.isInstanceOf[EAMSGD[T]]
+    val su = state.getOrElse[Int]("commPeriod", 1)
 
     var epochStart = System.nanoTime()
     var dataRDD = dataset.data(train = true)
@@ -162,7 +163,9 @@ object DistriOptimizer {
           } else {
             (cached.modelWeights.head, cached.gradient)
           }
-          val weightsResult = parameters.getWeights(localParamsBuffer)
+          val weightsResult = if (iteration % su == 0) {
+             parameters.getWeights(localParamsBuffer)
+          }
           val tensorBuffer = new Array[(Tensor[T], Tensor[T])](_subModelNumber)
           tasks += Engine.default.invoke(() => {
             val batch = data.next()
@@ -185,7 +188,9 @@ object DistriOptimizer {
             }
           })
           Engine.default.sync(tasks)
-          weightsResult.waitResult()
+          if (iteration % su == 0) {
+            weightsResult.asInstanceOf[FutureResult[Int]].waitResult()
+          }
           val weightSyncTime = System.nanoTime() - syWStart
           driverMetrics.add("get weights average", weightSyncTime)
           driverMetrics.add("get weights for each node", weightSyncTime)
@@ -261,15 +266,18 @@ object DistriOptimizer {
 
                 cached.gradient.narrow(1, offset + 1, length).div(ev.fromType(finishedThreads.size))
                 // elastic difference = (xi - x*)
-                cached.elasticDifference.narrow(1, offset + 1, length)
-                  .mul(ev.fromType(-1))
-                  .add(cached.modelWeights.head.narrow(1, offset + 1, length))
+                if (iteration % su == 0) {
+                  cached.elasticDifference.narrow(1, offset + 1, length)
+                    .mul(ev.fromType(-1))
+                    .add(cached.modelWeights.head.narrow(1, offset + 1, length))
+                }
               }))
               driverMetrics.add("computing elastic difference time", System.nanoTime() - time)
             }
           }
-
-          parameters.putGradients(putParamsBuffer)
+          if (iteration % su == 0) {
+            parameters.putGradients(putParamsBuffer)
+          }
           tasks ++= Engine.default.invoke((0 until _subModelNumber).map(i => () => {
             cached.localModels(i).training()
             cached.localModels(i).zeroGradParameters()
@@ -282,9 +290,13 @@ object DistriOptimizer {
         val value = lossSum.value / finishedModelNum
         models.mapPartitions(modelIter => {
           val modelCache = modelIter.next()
-          parameters.aggregrateGradientPartition()
+          if (iteration % su == 0) {
+            parameters.aggregrateGradientPartition()
+          }
           if (isEASGD) {
             val config = modelCache.localStates.head
+            config("_subModelNumber") = _subModelNumber
+            config("iteration") = iteration
             config("lg") = modelCache.gradient            // local gradient
             config("lw") = modelCache.modelWeights.head   // local weight
             config("led") = modelCache.elasticDifference  // local elastic difference
@@ -296,7 +308,10 @@ object DistriOptimizer {
           optimMethod.optimize(_ => (ev.fromType(value), parameters.gradientPartition),
             parameters.weightPartition, modelCache.localStates.head, modelCache.localStates.head)
 
-          parameters.sendWeightPartition()
+          if (iteration % su == 0) {
+            parameters.sendWeightPartition()
+          }
+
           Iterator.empty
         }).count()
 

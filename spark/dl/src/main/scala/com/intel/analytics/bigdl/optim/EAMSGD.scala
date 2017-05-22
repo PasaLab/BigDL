@@ -19,7 +19,7 @@ package com.intel.analytics.bigdl.optim
 import com.intel.analytics.bigdl.optim.SGD.{Default, LearningRateSchedule}
 import com.intel.analytics.bigdl.tensor.Tensor
 import com.intel.analytics.bigdl.tensor.TensorNumericMath.TensorNumeric
-import com.intel.analytics.bigdl.utils.{T, Table}
+import com.intel.analytics.bigdl.utils.{Engine, T, Table}
 
 import scala.reflect.ClassTag
 
@@ -65,7 +65,7 @@ class EAMSGD[@specialized(Float, Double) T: ClassTag](implicit ev: TensorNumeric
 
     val mom = _config.getOrElse[Double]("momentum", 0.0)
     val wd = ev.fromType(_config.getOrElse[Double]("weightDecay", 0.0))
-    val nevals = _state.get[Int]("evalCounter").getOrElse(0)
+    val iteration = _config.getOrElse[Int]("iteration", 0)
     val mr = _config.getOrElse[Double]("movingRate", 0.0)
     val su = _config.getOrElse[Int]("commPeriod", 1) // sync update
 
@@ -75,27 +75,51 @@ class EAMSGD[@specialized(Float, Double) T: ClassTag](implicit ev: TensorNumeric
     val lw = _config.get[Tensor[T]]("lw").get        // local weight
     val led = _config.get[Tensor[T]]("led").get      // local elastic difference
 
+    val _subModelNumber = _config.get[Int]("_subModelNumber").get
+    require(_subModelNumber > 0)
+    val gradLength = lw.nElement()
+    val taskSize = gradLength / _subModelNumber
+    val extraTask = gradLength % _subModelNumber
+    val parallelNum = if (taskSize == 0) extraTask else _subModelNumber
+
     val (fx, ged) = feval(x)                         // global elastic difference
 
-    if (nevals % su == 0) {
-      lw.add(ev.fromType(-1 * mr), led) // TODO: do this on multi-core in parallel
-      x.add(ev.fromType(mr), ged)
+    if (iteration % su == 0) {
+      Engine.default.invokeAndWait((0 until parallelNum).map(tid => () => { // multi-core parallel
+        val offset = tid * taskSize + math.min(tid, extraTask)
+        val length = taskSize + (if (tid < extraTask) 1 else 0)
+        lw.narrow(1, offset + 1, length).add(ev.fromType(-mr), led.narrow(1, offset + 1, length))
+      }))
+      x.add(ev.fromType(mr), ged) // global update
     }
-    if (wd != 0) lg.add(wd, lw) // TODO: do this on multi-core in parallel
 
-    if (mom > 0) {
-      if (_state.get[Tensor[T]]("vt").isDefined) {
-        _state.get[Tensor[T]]("vt").get.mul(ev.fromType(mom)) // vt = mom * vt
-        lw.add(_state.get[Tensor[T]]("vt").get)               // xi = xi + mom*vt
-      } else {
-        _state("vt") = Tensor[T]().resizeAs(lw).zero()
+    Engine.default.invokeAndWait((0 until parallelNum).map(tid => () => {
+      // multi-core parallel
+      val offset = tid * taskSize + math.min(tid, extraTask)
+      val length = taskSize + (if (tid < extraTask) 1 else 0)
+
+      if (wd != 0) lg.narrow(1, offset + 1, length).add(wd, lw.narrow(1, offset + 1, length))
+
+      if (mom > 0) {
+        if (_state.get[Tensor[T]]("vt").isDefined) {
+          _state.get[Tensor[T]]("vt").get
+            .narrow(1, offset + 1, length)
+            .mul(ev.fromType(mom)) // vt = mom * vt
+          lw.narrow(1, offset + 1, length)
+            .add(_state.get[Tensor[T]]("vt").get.narrow(1, offset + 1, length)) // xi = xi + mom*vt
+        } else {
+          _state("vt") = Tensor[T]().resizeAs(lw).zero()
+        }
       }
-    }
 
-    val clr = ev.fromType(_config[Double]("clr"))
-    lw.add(clr, lg) // TODO: do this in parallel
+      val clr = ev.fromType(_config[Double]("clr"))
+      lw.narrow(1, offset + 1, length).add(clr, lg.narrow(1, offset + 1, length))
 
-    if (mom > 0) _state.get[Tensor[T]]("vt").get.add(clr, lg)
+      if (mom > 0) _state.get[Tensor[T]]("vt").get.narrow(1, offset + 1, length)
+        .add(clr, lg.narrow(1, offset + 1, length))
+
+    }))
+
     (x, Array(fx))
   }
 
@@ -105,6 +129,7 @@ class EAMSGD[@specialized(Float, Double) T: ClassTag](implicit ev: TensorNumeric
 
   override def getHyperParameter(config: Table): String = {
     val clr = -config[Double]("clr")
+    val _subModelNumber = config.getOrElse[Int]("_subModelNumber", 0)
     val wd = config.getOrElse[Double]("weightDecay", 0.0)
     val mom = config.getOrElse[Double]("momentum", 0.0)
     val mr = config.getOrElse[Double]("movingRate", 0.0)
